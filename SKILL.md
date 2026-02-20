@@ -13,6 +13,26 @@ This skill defines **required** behavior, not suggestions. Reading files without
 
 ---
 
+## Model Strategy
+
+Different tools use different models. Flash is fast and accurate enough for location lookups. Pro is used only when deep reasoning is needed.
+
+| Tool | Model | Why |
+|------|-------|-----|
+| `index_query` | `gemini-2.5-flash` | Simple location lookup — speed matters |
+| `index_summarize` | `gemini-2.5-flash` | Structure mapping — speed matters |
+| `index_analyze` | `gemini-2.5-pro` | Cross-file reasoning — quality matters |
+| `index_trace` | `gemini-2.5-pro` | Call chain reasoning — quality matters |
+
+All calls use `--yolo` to skip confirmation prompts and `--output-format json` for structured output.
+
+**Base call pattern:**
+```bash
+gemini --yolo -m {MODEL} -p "{PROMPT}" --output-format json
+```
+
+---
+
 ## REQUIRED: Session Start Protocol
 
 **Every CC session on a repo with more than 10 files MUST begin with this:**
@@ -58,7 +78,7 @@ fi
 
 ### Step 3 — Run index_summarize
 ```bash
-cd {REPO_PATH} && gemini -p "
+cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "
 Give me a complete architectural overview of this codebase.
 
 Respond ONLY as JSON, no markdown:
@@ -114,10 +134,10 @@ These are HARD RULES, not guidelines:
 
 ## Tool: index_query
 
-**REQUIRED before any unknown file read.**
+**REQUIRED before any unknown file read. Uses Flash — fast.**
 
 ```bash
-cd {REPO_PATH} && gemini -p "
+cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "
 Locate the following in this codebase: {QUESTION}
 
 Respond ONLY as JSON, no markdown:
@@ -136,10 +156,10 @@ Respond ONLY as JSON, no markdown:
 
 ## Tool: index_analyze
 
-**REQUIRED before modifying anything that touches multiple files.**
+**REQUIRED before modifying anything that touches multiple files. Uses Pro — accurate.**
 
 ```bash
-cd {REPO_PATH} && gemini -p "
+cd {REPO_PATH} && gemini --yolo -m gemini-2.5-pro -p "
 Analyze the following in this codebase: {QUESTION}
 
 Respond ONLY as JSON, no markdown:
@@ -156,10 +176,10 @@ Respond ONLY as JSON, no markdown:
 
 ## Tool: index_trace
 
-**REQUIRED before debugging or modifying any cross-service or cross-file flow.**
+**REQUIRED before debugging or modifying any cross-service or cross-file flow. Uses Pro — accurate.**
 
 ```bash
-cd {REPO_PATH} && gemini -p "
+cd {REPO_PATH} && gemini --yolo -m gemini-2.5-pro -p "
 Trace the following flow in this codebase: from {TRACE_FROM} to {TRACE_TO}
 
 Respond ONLY as JSON, no markdown:
@@ -178,10 +198,10 @@ Respond ONLY as JSON, no markdown:
 
 ## Tool: index_summarize
 
-**REQUIRED at session start and after every compaction.**
+**REQUIRED at session start and after every compaction. Uses Flash — fast.**
 
 ```bash
-cd {REPO_PATH} && gemini -p "
+cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "
 Give me a complete architectural overview of this codebase.
 
 Respond ONLY as JSON, no markdown:
@@ -205,22 +225,22 @@ Respond ONLY as JSON, no markdown:
 ```
 Session starts
       ↓
-MANDATORY: index_summarize → get architecture map
+MANDATORY: index_summarize (Flash) → get architecture map
       ↓
 User asks to implement or fix something
       ↓
 Is exact file path confirmed from index in THIS session?
       YES → read only that file
-      NO  → MANDATORY: index_query first, then read only result files
+      NO  → MANDATORY: index_query (Flash) first, read only result files
       ↓
 Does task touch multiple files or services?
-      YES → MANDATORY: index_analyze or index_trace before any reads
+      YES → MANDATORY: index_analyze (Pro) or index_trace (Pro)
       NO  → proceed with confirmed files only
       ↓
 Implement using only indexed files
       ↓
 Compaction occurs?
-      YES → MANDATORY: index_summarize before continuing
+      YES → MANDATORY: index_summarize (Flash) before continuing
 ```
 
 ---
@@ -233,6 +253,8 @@ Compaction occurs?
 4. **Never re-read a file already read in this session — use context**
 5. **Always run index_summarize after compaction before any further reads**
 6. **Batch related unknowns into one index call — not multiple**
+7. **Always use --yolo flag — never let Gemini pause for confirmation**
+8. **Always use -m flag to set the correct model per tool**
 
 ---
 
@@ -248,7 +270,7 @@ Search utils/ for JWT references
 
 ✅ REQUIRED — Do this:
 index_query("where is JWT token validation and expiry handled")
-→ returns exact files
+→ Flash returns exact files in seconds
 → read only those files
 → fix bug
 ```
@@ -263,7 +285,7 @@ Read message queue config
 
 ✅ REQUIRED — Do this:
 index_trace("POST /orders endpoint", "inventory update")
-→ Gemini returns full chain
+→ Pro traces full chain accurately
 → read only chain files
 → debug
 ```
@@ -275,7 +297,7 @@ Compaction occurs mid-session
 Resume and re-read files from earlier session
 
 ✅ REQUIRED — Do this:
-index_summarize()
-→ re-orient in 2k tokens
+index_summarize()  ← Flash, fast re-orient
+→ get architecture map in seconds
 → continue
 ```
