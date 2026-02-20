@@ -9,8 +9,6 @@ description: MANDATORY - Use Gemini CLI as a smart codebase index before reading
 
 This skill defines **required** behavior, not suggestions. Reading files without querying the index first is a violation that wastes the user's Claude context budget. When in doubt — query first, read after.
 
-**Gemini = Explorer. Claude = Builder.**
-
 ---
 
 ## Model Strategy
