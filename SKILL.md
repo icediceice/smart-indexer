@@ -15,20 +15,27 @@ This skill defines **required** behavior, not suggestions. Reading files without
 
 ## Model Strategy
 
-Different tools use different models. Flash is fast and accurate enough for location lookups. Pro is used only when deep reasoning is needed.
+All tools use `gemini-2.5-flash` with automatic fallback to `gemini-3-flash-preview` if quota or RPM limit is hit. Gemini re-reads files fresh on every call — every headless bash invocation is a cold session, no cache persists between calls. Each call costs ~9k tokens minimum, so batching questions is critical.
 
-| Tool | Model | Why |
-|------|-------|-----|
-| `index_query` | `gemini-2.5-flash` | Simple location lookup — speed matters |
-| `index_summarize` | `gemini-2.5-flash` | Structure mapping — speed matters |
-| `index_analyze` | `gemini-2.5-pro` | Cross-file reasoning — quality matters |
-| `index_trace` | `gemini-2.5-pro` | Call chain reasoning — quality matters |
+**Fallback chain:** `gemini-2.5-flash` → `gemini-3-flash-preview` → error with account switch prompt
+
+Note: `gemini-2.5-flash` and `gemini-2.5-flash-lite` share the same quota bucket — no point falling back between them. `gemini-3-flash-preview` is a separate bucket. Fallback handles both daily quota exhaustion and RPM rate limits.
 
 All calls use `--yolo` to skip confirmation prompts and `--output-format json` for structured output.
 
-**Base call pattern:**
+**Reusable fallback wrapper — use this pattern for every tool call:**
 ```bash
-gemini --yolo -m {MODEL} -p "{PROMPT}" --output-format json
+PROMPT="..."
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
 ```
 
 ---
@@ -78,8 +85,7 @@ fi
 
 ### Step 3 — Run index_summarize
 ```bash
-cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "
-Give me a complete architectural overview of this codebase.
+PROMPT="Give me a complete architectural overview of this codebase.
 
 Respond ONLY as JSON, no markdown:
 {
@@ -91,8 +97,18 @@ Respond ONLY as JSON, no markdown:
   \"entry_points\": [\"how to run or start the project\"],
   \"data_flow\": \"how data moves through the system\",
   \"key_directories\": {\"dir\": \"purpose\"}
-}
-" --output-format json
+}"
+
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
 ```
 
 **Do not read any files before completing Step 3.**
@@ -118,8 +134,9 @@ These are HARD RULES, not guidelines:
 | Situation | REQUIRED Action |
 |-----------|----------------|
 | Session start on any repo > 10 files | MUST run `index_summarize` |
-| File location unknown | MUST run `index_query` before any read |
-| About to use grep, find, or ls to search | MUST run `index_query` instead |
+| 2+ file locations unknown | MUST run `index_batch` — never loop index_query |
+| File location unknown (single) | MUST run `index_query` before any read |
+| About to use grep, find, or ls to search | MUST run `index_batch` or `index_query` instead |
 | Task involves multiple files or services | MUST run `index_analyze` first |
 | Tracing a call chain or data flow | MUST run `index_trace` first |
 | After compaction event | MUST run `index_summarize` before continuing |
@@ -132,13 +149,51 @@ These are HARD RULES, not guidelines:
 
 ---
 
-## Tool: index_query
+## Tool: index_batch
 
-**REQUIRED before any unknown file read. Uses Flash — fast.**
+**USE THIS FIRST when you have 2+ unknowns. Combines multiple questions into one Gemini call — saves ~9k tokens per question avoided.**
 
 ```bash
-cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "
-Locate the following in this codebase: {QUESTION}
+PROMPT="Answer all of the following questions about this codebase in a single response.
+
+Questions:
+1. {QUESTION_1}
+2. {QUESTION_2}
+3. {QUESTION_3}
+
+Respond ONLY as JSON, no markdown:
+{
+  \"answers\": [
+    {
+      \"question\": \"exact question text\",
+      \"locations\": [{\"file\": \"relative/path\", \"context\": \"what it does here\"}],
+      \"summary\": \"one sentence answer\"
+    }
+  ]
+}"
+
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
+```
+
+**Rule: If you have 2 or more unknowns before starting a task — batch them. Never call index_query in a loop.**
+
+---
+
+## Tool: index_query
+
+**REQUIRED before any unknown file read. Use index_batch instead if you have 2+ questions.**
+
+```bash
+PROMPT="Locate the following in this codebase: {QUESTION}
 
 Respond ONLY as JSON, no markdown:
 {
@@ -146,8 +201,18 @@ Respond ONLY as JSON, no markdown:
     {\"file\": \"relative/path/to/file\", \"context\": \"what it does here\"}
   ],
   \"summary\": \"one sentence answer\"
-}
-" --output-format json
+}"
+
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
 ```
 
 **After result: Read ONLY the files listed. No additional reads.**
@@ -156,11 +221,10 @@ Respond ONLY as JSON, no markdown:
 
 ## Tool: index_analyze
 
-**REQUIRED before modifying anything that touches multiple files. Uses Pro — accurate.**
+**REQUIRED before modifying anything that touches multiple files.**
 
 ```bash
-cd {REPO_PATH} && gemini --yolo -m gemini-2.5-pro -p "
-Analyze the following in this codebase: {QUESTION}
+PROMPT="Analyze the following in this codebase: {QUESTION}
 
 Respond ONLY as JSON, no markdown:
 {
@@ -168,19 +232,28 @@ Respond ONLY as JSON, no markdown:
   \"relevant_files\": [\"file1\", \"file2\"],
   \"data_flow\": \"how data or control moves through the system\",
   \"warnings\": [\"anything important to know before modifying\"]
-}
-" --output-format json
+}"
+
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
 ```
 
 ---
 
 ## Tool: index_trace
 
-**REQUIRED before debugging or modifying any cross-service or cross-file flow. Uses Pro — accurate.**
+**REQUIRED before debugging or modifying any cross-service or cross-file flow.**
 
 ```bash
-cd {REPO_PATH} && gemini --yolo -m gemini-2.5-pro -p "
-Trace the following flow in this codebase: from {TRACE_FROM} to {TRACE_TO}
+PROMPT="Trace the following flow in this codebase: from {TRACE_FROM} to {TRACE_TO}
 
 Respond ONLY as JSON, no markdown:
 {
@@ -190,19 +263,28 @@ Respond ONLY as JSON, no markdown:
   \"entry_point\": \"where it starts\",
   \"exit_point\": \"where it ends\",
   \"summary\": \"one sentence overview of the flow\"
-}
-" --output-format json
+}"
+
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
 ```
 
 ---
 
 ## Tool: index_summarize
 
-**REQUIRED at session start and after every compaction. Uses Flash — fast.**
+**REQUIRED at session start and after every compaction.**
 
 ```bash
-cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "
-Give me a complete architectural overview of this codebase.
+PROMPT="Give me a complete architectural overview of this codebase.
 
 Respond ONLY as JSON, no markdown:
 {
@@ -214,8 +296,18 @@ Respond ONLY as JSON, no markdown:
   \"entry_points\": [\"how to run or start the project\"],
   \"data_flow\": \"how data moves through the system\",
   \"key_directories\": {\"dir\": \"purpose\"}
-}
-" --output-format json
+}"
+
+RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-2.5-flash -p "$PROMPT" --output-format json 2>&1)
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted"; then
+  echo "[smart-index] Flash limit hit, falling back to Gemini 3 Flash Preview..."
+  RESULT=$(cd {REPO_PATH} && gemini --yolo -m gemini-3-flash-preview -p "$PROMPT" --output-format json 2>&1)
+fi
+if echo "$RESULT" | grep -qi "quota\|rate.limit\|429\|exhausted\|not.found\|unavailable"; then
+  echo '[smart-index] {"error": "all_models_limited", "action": "Switch Google account: gemini auth login"}'
+else
+  echo "$RESULT"
+fi
 ```
 
 ---
@@ -225,22 +317,26 @@ Respond ONLY as JSON, no markdown:
 ```
 Session starts
       ↓
-MANDATORY: index_summarize (Flash) → get architecture map
+MANDATORY: index_summarize → get architecture map
       ↓
 User asks to implement or fix something
       ↓
 Is exact file path confirmed from index in THIS session?
       YES → read only that file
-      NO  → MANDATORY: index_query (Flash) first, read only result files
+      NO  → MANDATORY: index_query first, read only result files
       ↓
 Does task touch multiple files or services?
-      YES → MANDATORY: index_analyze (Pro) or index_trace (Pro)
+      YES → MANDATORY: index_analyze or index_trace
       NO  → proceed with confirmed files only
       ↓
 Implement using only indexed files
       ↓
 Compaction occurs?
-      YES → MANDATORY: index_summarize (Flash) before continuing
+      YES → MANDATORY: index_summarize before continuing
+      ↓
+Quota exhausted mid-session?
+      Flash-Lite fallback triggers automatically
+      Both exhausted → run: gemini auth login (switch account)
 ```
 
 ---
@@ -252,9 +348,9 @@ Compaction occurs?
 3. **Never skip session start index_summarize on repos > 10 files**
 4. **Never re-read a file already read in this session — use context**
 5. **Always run index_summarize after compaction before any further reads**
-6. **Batch related unknowns into one index call — not multiple**
+6. **Always use index_batch when you have 2+ unknowns — never call index_query in a loop**
 7. **Always use --yolo flag — never let Gemini pause for confirmation**
-8. **Always use -m flag to set the correct model per tool**
+8. **Always use the fallback wrapper — never call gemini directly without quota handling**
 
 ---
 
@@ -270,7 +366,7 @@ Search utils/ for JWT references
 
 ✅ REQUIRED — Do this:
 index_query("where is JWT token validation and expiry handled")
-→ Flash returns exact files in seconds
+→ Flash returns exact files, falls back to Flash-Lite if needed
 → read only those files
 → fix bug
 ```
@@ -285,7 +381,7 @@ Read message queue config
 
 ✅ REQUIRED — Do this:
 index_trace("POST /orders endpoint", "inventory update")
-→ Pro traces full chain accurately
+→ Flash traces full chain across all files
 → read only chain files
 → debug
 ```
@@ -297,7 +393,7 @@ Compaction occurs mid-session
 Resume and re-read files from earlier session
 
 ✅ REQUIRED — Do this:
-index_summarize()  ← Flash, fast re-orient
-→ get architecture map in seconds
+index_summarize()
+→ re-orient in seconds
 → continue
 ```
